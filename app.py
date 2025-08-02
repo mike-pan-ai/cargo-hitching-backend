@@ -19,9 +19,14 @@ def create_app():
     # Configure CORS
     CORS(app, origins=app.config['CORS_ORIGINS'])
 
-    # Create tables
+    # Create tables within application context
     with app.app_context():
-        db.create_all()
+        try:
+            db.create_all()
+            print("✅ Database tables created successfully")
+        except Exception as e:
+            print(f"⚠️ Database initialization warning: {e}")
+            # Continue anyway - tables might already exist
 
     # Register blueprints
     register_blueprints(app)
@@ -139,10 +144,8 @@ def api_info():
 @app.route('/api/health')
 def detailed_health():
     try:
-        # Test database connection - UPDATED FOR SQLALCHEMY 2.0
-        from sqlalchemy import text
-        db.session.execute(text('SELECT 1'))
-        db.session.commit()
+        # Test database connection
+        db.session.execute('SELECT 1')
         db_status = "connected"
     except Exception as e:
         db_status = f"error: {str(e)}"
@@ -161,20 +164,26 @@ def detailed_health():
 
 
 if __name__ == '__main__':
-    print("🚀 Starting Cargo Hitching API...")
+    import os
+
+    # Get port from environment variable (Railway sets this)
+    port = int(os.environ.get('PORT', 5000))
+
+    # Set debug based on environment
+    debug_mode = os.getenv('FLASK_ENV', 'production') == 'development'
+
+    print(f"🚀 Starting Cargo Hitching API on port {port}...")
     print("📍 Available endpoints:")
-    print("   - Health check: http://localhost:5000/")
-    print("   - API info: http://localhost:5000/api")
-    print("   - Detailed health: http://localhost:5000/api/health")
-    print("   - Auth endpoints: http://localhost:5000/api/auth")
-    print("   - Trip endpoints: http://localhost:5000/api/trips")
-    print("   - User endpoints: http://localhost:5000/api/users")
-    print("   - Message endpoints: http://localhost:5000/api/messages")
-    print("🌍 Frontend: http://localhost:3000")
-    print("🔧 Backend:  http://localhost:5000")
+    print("   - Health check: /")
+    print("   - API info: /api")
+    print("   - Detailed health: /api/health")
+    print("   - Auth endpoints: /api/auth")
+    print("   - Trip endpoints: /api/trips")
+    print("   - User endpoints: /api/users")
+    print("   - Message endpoints: /api/messages")
 
     app.run(
-        debug=True,
+        debug=debug_mode,
         host='0.0.0.0',
-        port=5000
+        port=port
     )
