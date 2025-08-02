@@ -144,8 +144,10 @@ def api_info():
 @app.route('/api/health')
 def detailed_health():
     try:
-        # Test database connection
-        db.session.execute('SELECT 1')
+        # Test database connection - FIXED FOR SQLALCHEMY 2.0
+        from sqlalchemy import text
+        db.session.execute(text('SELECT 1'))
+        db.session.commit()
         db_status = "connected"
     except Exception as e:
         db_status = f"error: {str(e)}"
