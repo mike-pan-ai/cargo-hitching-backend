@@ -3,7 +3,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-
 class Config:
     """Base configuration class"""
 
@@ -12,9 +11,9 @@ class Config:
     DEBUG = False
     TESTING = False
 
-    # Database config
-    MONGO_URI = os.getenv('MONGO_URI')
-    DATABASE_NAME = 'cargo_hitching_app'
+    # Database config - UPDATED FOR POSTGRESQL
+    SQLALCHEMY_DATABASE_URI = os.getenv('DATABASE_URL')
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
 
     # JWT config
     JWT_SECRET = os.getenv('JWT_SECRET')
@@ -38,11 +37,8 @@ class Config:
     def validate_config():
         """Validate that all required environment variables are set"""
         required_vars = [
-            'MONGO_URI',
-            'JWT_SECRET',
-            'MAIL_SERVER',
-            'MAIL_USERNAME',
-            'MAIL_PASSWORD'
+            'DATABASE_URL',
+            'JWT_SECRET'
         ]
 
         missing_vars = []
@@ -67,16 +63,16 @@ class ProductionConfig(Config):
     DEBUG = False
     # Override CORS_ORIGINS with specific production domains
     CORS_ORIGINS = [
-        'https://seasonship.com',
-        'https://www.seasonship.com',  # With www prefix
-        'https://*.vercel.app'         # Vercel preview domains
+        'https://yourdomain.com',  # Replace with your actual domain
+        'https://www.yourdomain.com',  # With www prefix
+        'https://*.vercel.app'  # Vercel preview domains
     ]
 
 
 class TestingConfig(Config):
     """Testing configuration"""
     TESTING = True
-    DATABASE_NAME = 'cargo_hitching_app_test'
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///:memory:'  # In-memory SQLite for tests
 
 
 # Configuration dictionary

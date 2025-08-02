@@ -1,63 +1,53 @@
 from flask import Flask, jsonify
-from config import config
-from extensions import init_extensions, create_indexes
-import os
 from flask_cors import CORS
+from config import config
+from models import db
 import os
-from dotenv import load_dotenv
 
-load_dotenv()
 
-def create_app(config_name=None):
+def create_app():
     """Application factory pattern"""
-    if config_name is None:
-        config_name = os.getenv('FLASK_ENV', 'development')
-
     app = Flask(__name__)
 
     # Load configuration
+    config_name = os.getenv('FLASK_ENV', 'development')
     app.config.from_object(config[config_name])
 
-    # Validate configuration
-    try:
-        config[config_name].validate_config()
-    except ValueError as e:
-        print(f"Configuration error: {e}")
-        raise
-
     # Initialize extensions
-    init_extensions(app)
+    db.init_app(app)
+
+    # Configure CORS
+    CORS(app, origins=app.config['CORS_ORIGINS'])
+
+    # Create tables
+    with app.app_context():
+        db.create_all()
 
     # Register blueprints
     register_blueprints(app)
 
-    # Create database indexes
-    with app.app_context():
-        create_indexes()
-
     # Register error handlers
     register_error_handlers(app)
-
-    CORS(app, origins=[
-        "http://localhost:3000",  # Development
-        "https://yourdomain.com",  # Replace with your actual domain
-        "https://www.yourdomain.com",  # With www
-        "https://*.vercel.app"  # Vercel preview domains
-    ])
 
     return app
 
 
 def register_blueprints(app):
-    """Register all blueprints"""
-    # Existing blueprints
-    from routes.auth import auth_bp
-    from routes.trips import trips_bp
+    """Register application blueprints"""
+    try:
+        from routes.auth import auth_bp
+        app.register_blueprint(auth_bp, url_prefix='/api/auth')
+        print("✅ Auth blueprint registered successfully")
+    except ImportError as e:
+        print(f"⚠️ Auth blueprint not found: {e}")
 
-    app.register_blueprint(auth_bp, url_prefix='/api/auth')
-    app.register_blueprint(trips_bp, url_prefix='/api/trips')
+    try:
+        from routes.trips import trips_bp
+        app.register_blueprint(trips_bp, url_prefix='/api/trips')
+        print("✅ Trips blueprint registered successfully")
+    except ImportError as e:
+        print(f"⚠️ Trips blueprint not found: {e}")
 
-    # NEW BLUEPRINTS for public profiles
     try:
         from routes.users import users_bp
         app.register_blueprint(users_bp, url_prefix='/api/users')
@@ -66,60 +56,11 @@ def register_blueprints(app):
         print(f"⚠️ Users blueprint not found: {e}")
 
     try:
-        from routes.reviews import reviews_bp
-        app.register_blueprint(reviews_bp, url_prefix='/api/reviews')
-        print("✅ Reviews blueprint registered successfully")
-    except ImportError as e:
-        print(f"⚠️ Reviews blueprint not found: {e}")
-
-    try:
         from routes.messages import messages_bp
         app.register_blueprint(messages_bp, url_prefix='/api/messages')
         print("✅ Messages blueprint registered successfully")
     except ImportError as e:
         print(f"⚠️ Messages blueprint not found: {e}")
-
-    # Add a simple health check route
-    @app.route('/')
-    def health_check():
-        return jsonify({
-            "message": "Cargo Hitching API is running!",
-            "status": "healthy",
-            "version": "1.0.0"
-        })
-
-    @app.route('/api')
-    def api_info():
-        return jsonify({
-            "message": "Cargo Hitching API",
-            "endpoints": {
-                "auth": "/api/auth",
-                "trips": "/api/trips",
-                "users": "/api/users",
-                "reviews": "/api/reviews",
-                "messages": "/api/messages"
-        }
-        })
-
-    @app.route('/api/health')
-    def detailed_health():
-        """Detailed health check with all available endpoints"""
-        return jsonify({
-            "message": "API is working",
-            "status": "healthy",
-            "endpoints": [
-                "POST /api/auth/register",
-                "POST /api/auth/login",
-                "GET  /api/auth/me",
-                "GET  /api/trips/search",
-                "POST /api/trips/add",
-                "GET  /api/trips/my-trips",
-                "GET  /api/users/profile/<user_id>",
-                "PUT  /api/users/profile",
-                "GET  /api/reviews/user/<user_id>",
-                "POST /api/reviews/add"
-            ]
-        }), 200
 
 
 def register_error_handlers(app):
@@ -129,15 +70,12 @@ def register_error_handlers(app):
     def not_found(error):
         return jsonify({
             "error": "Not Found",
-            "message": "The requested resource was not found on this server.",
-            "available_endpoints": {
-                "health": "/",
-                "api_info": "/api",
-                "detailed_health": "/api/health",
+            "message": "The requested resource was not found.",
+            "endpoints": {
                 "auth": "/api/auth",
                 "trips": "/api/trips",
                 "users": "/api/users",
-                "reviews": "/api/reviews"
+                "messages": "/api/messages"
             }
         }), 404
 
@@ -173,6 +111,55 @@ def register_error_handlers(app):
 # Create app instance
 app = create_app()
 
+
+# Health check routes
+@app.route('/')
+def health_check():
+    return jsonify({
+        "message": "Cargo Hitching API",
+        "status": "healthy",
+        "database": "postgresql",
+        "version": "2.0"
+    })
+
+
+@app.route('/api')
+def api_info():
+    return jsonify({
+        "message": "Cargo Hitching API",
+        "endpoints": {
+            "auth": "/api/auth",
+            "trips": "/api/trips",
+            "users": "/api/users",
+            "messages": "/api/messages"
+        }
+    })
+
+
+@app.route('/api/health')
+def detailed_health():
+    try:
+        # Test database connection - UPDATED FOR SQLALCHEMY 2.0
+        from sqlalchemy import text
+        db.session.execute(text('SELECT 1'))
+        db.session.commit()
+        db_status = "connected"
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+
+    return jsonify({
+        "status": "healthy",
+        "database": db_status,
+        "environment": os.getenv('FLASK_ENV', 'development'),
+        "endpoints": {
+            "auth": "/api/auth - Authentication endpoints",
+            "trips": "/api/trips - Trip management",
+            "users": "/api/users - User profiles",
+            "messages": "/api/messages - Messaging system"
+        }
+    })
+
+
 if __name__ == '__main__':
     print("🚀 Starting Cargo Hitching API...")
     print("📍 Available endpoints:")
@@ -182,7 +169,7 @@ if __name__ == '__main__':
     print("   - Auth endpoints: http://localhost:5000/api/auth")
     print("   - Trip endpoints: http://localhost:5000/api/trips")
     print("   - User endpoints: http://localhost:5000/api/users")
-    print("   - Review endpoints: http://localhost:5000/api/reviews")
+    print("   - Message endpoints: http://localhost:5000/api/messages")
     print("🌍 Frontend: http://localhost:3000")
     print("🔧 Backend:  http://localhost:5000")
 

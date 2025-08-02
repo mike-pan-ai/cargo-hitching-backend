@@ -1,95 +1,100 @@
 from flask import Blueprint, request, jsonify
-from db import TripModel, convert_objectid_to_string
+from models import db, Trip, User
 from auth_guard import token_required, optional_token
-from datetime import datetime
+from datetime import datetime, date
 import re
+from sqlalchemy import and_, or_
 
 trips_bp = Blueprint('trips', __name__)
 
 
-def validate_date(date_str):
-    """Validate date in DDMMYYYY format"""
-    try:
-        if len(date_str) != 8 or not date_str.isdigit():
-            return False, "Date must be in DDMMYYYY format"
-
-        day = int(date_str[:2])
-        month = int(date_str[2:4])
-        year = int(date_str[4:])
-
-        # Basic validation
-        if month < 1 or month > 12:
-            return False, "Invalid month"
-        if day < 1 or day > 31:
-            return False, "Invalid day"
-        if year < datetime.now().year:
-            return False, "Date cannot be in the past"
-
-        # Create datetime object to validate the date
-        trip_date = datetime(year, month, day)
-        if trip_date < datetime.now():
-            return False, "Date cannot be in the past"
-
-        return True, "Valid date"
-
-    except ValueError:
-        return False, "Invalid date format"
-
-
 def validate_trip_data(data):
-    """Validate trip creation data"""
+    """Validate trip creation/update data"""
     errors = []
 
-    # Required fields
+    # Required fields for creation
     required_fields = ['country_from', 'country_to', 'date', 'rate_per_kg', 'available_cargo_space']
     for field in required_fields:
-        if not data.get(field):
+        if field not in data or not data[field]:
             errors.append(f"{field} is required")
 
-    if errors:
-        return False, errors
+    # Validate date format (DDMMYYYY)
+    if 'date' in data and data['date']:
+        date_pattern = r'^\d{8}$'  # DDMMYYYY format
+        if not re.match(date_pattern, str(data['date'])):
+            errors.append("Date must be in DDMMYYYY format")
+        else:
+            try:
+                # Parse DDMMYYYY format
+                date_str = str(data['date'])
+                day = int(date_str[:2])
+                month = int(date_str[2:4])
+                year = int(date_str[4:8])
 
-    # Validate countries
-    country_from = data.get('country_from', '').strip()
-    country_to = data.get('country_to', '').strip()
+                # Validate date components
+                if not (1 <= day <= 31):
+                    errors.append("Invalid day in date")
+                elif not (1 <= month <= 12):
+                    errors.append("Invalid month in date")
+                elif year < datetime.now().year:
+                    errors.append("Year cannot be in the past")
+                else:
+                    # Check if date is valid and not in the past
+                    trip_date = date(year, month, day)
+                    if trip_date < date.today():
+                        errors.append("Date cannot be in the past")
+            except ValueError:
+                errors.append("Invalid date")
 
-    if len(country_from) < 2:
-        errors.append("Country from must be at least 2 characters")
-    if len(country_to) < 2:
-        errors.append("Country to must be at least 2 characters")
-    if country_from.lower() == country_to.lower():
-        errors.append("Departure and destination countries cannot be the same")
-
-    # Validate date
-    date_valid, date_msg = validate_date(data.get('date', ''))
-    if not date_valid:
-        errors.append(date_msg)
-
-    # Validate numeric fields
-    try:
-        rate_per_kg = float(data.get('rate_per_kg', 0))
-        if rate_per_kg <= 0:
-            errors.append("Rate per kg must be greater than 0")
-    except (ValueError, TypeError):
-        errors.append("Rate per kg must be a valid number")
-
-    try:
-        cargo_space = float(data.get('available_cargo_space', 0))
-        if cargo_space <= 0:
-            errors.append("Available cargo space must be greater than 0")
-        if cargo_space > 10000:  # Reasonable limit
-            errors.append("Available cargo space seems unreasonably large")
-    except (ValueError, TypeError):
-        errors.append("Available cargo space must be a valid number")
-
-    # Validate departure time if provided
-    departure_time = data.get('departure_time', '').strip()
-    if departure_time:
+    # Validate departure time format (HH:MM)
+    if 'departure_time' in data and data['departure_time']:
         time_pattern = r'^([01]?[0-9]|2[0-3]):[0-5][0-9]$'
-        if not re.match(time_pattern, departure_time):
+        if not re.match(time_pattern, data['departure_time']):
             errors.append("Departure time must be in HH:MM format")
 
+    # Validate numeric fields
+    if 'rate_per_kg' in data:
+        try:
+            rate = float(data['rate_per_kg'])
+            if rate <= 0:
+                errors.append("Rate per kg must be greater than 0")
+        except (ValueError, TypeError):
+            errors.append("Rate per kg must be a valid number")
+
+    if 'available_cargo_space' in data:
+        try:
+            space = int(data['available_cargo_space'])
+            if space <= 0:
+                errors.append("Available cargo space must be greater than 0")
+        except (ValueError, TypeError):
+            errors.append("Available cargo space must be a valid number")
+
+    # Validate string lengths
+    string_fields = {
+        'country_from': 100,
+        'country_to': 100,
+        'description': 1000,
+        'currency': 3,
+        'contact_info': 500
+    }
+
+    for field, max_length in string_fields.items():
+        if field in data and data[field] and len(str(data[field])) > max_length:
+            errors.append(f"{field} must be less than {max_length} characters")
+
     return len(errors) == 0, errors
+
+
+def parse_date_from_ddmmyyyy(date_str):
+    """Convert DDMMYYYY string to date object"""
+    try:
+        date_str = str(date_str)
+        day = int(date_str[:2])
+        month = int(date_str[2:4])
+        year = int(date_str[4:8])
+        return date(year, month, day)
+    except (ValueError, IndexError):
+        return None
 
 
 @trips_bp.route('/add', methods=['POST'])
@@ -106,20 +111,46 @@ def add_trip(current_user):
         if not is_valid:
             return jsonify({"error": "Validation failed", "details": validation_errors}), 400
 
-        # Create trip
-        trip_id = TripModel.create_trip(str(current_user['_id']), data)
+        # Parse date
+        trip_date = parse_date_from_ddmmyyyy(data['date'])
+        if not trip_date:
+            return jsonify({"error": "Invalid date format"}), 400
 
-        # Get the created trip
-        trip = TripModel.find_by_id(trip_id)
-        trip = convert_objectid_to_string(trip)
+        # Parse departure time if provided
+        departure_time = None
+        if data.get('departure_time'):
+            try:
+                time_parts = data['departure_time'].split(':')
+                departure_time = datetime.strptime(data['departure_time'], '%H:%M').time()
+            except ValueError:
+                return jsonify({"error": "Invalid departure time format"}), 400
+
+        # Create trip
+        new_trip = Trip(
+            user_id=current_user.id,
+            country_from=data['country_from'],
+            country_to=data['country_to'],
+            date=trip_date,
+            departure_time=departure_time,
+            rate_per_kg=float(data['rate_per_kg']),
+            available_cargo_space=int(data['available_cargo_space']),
+            description=data.get('description', ''),
+            currency=data.get('currency', 'EUR'),
+            contact_info=data.get('contact_info', ''),
+            status='active'
+        )
+
+        db.session.add(new_trip)
+        db.session.commit()
 
         return jsonify({
             "message": "Trip created successfully",
-            "trip_id": trip_id,
-            "trip": trip
+            "trip_id": new_trip.id,
+            "trip": new_trip.to_dict()
         }), 201
 
     except Exception as e:
+        db.session.rollback()
         print(f"Error creating trip: {e}")
         return jsonify({"error": "Failed to create trip"}), 500
 
@@ -129,34 +160,56 @@ def add_trip(current_user):
 def search_trips(current_user):
     """Search for trips with optional filters - excludes current user's own trips"""
     try:
-        filters = {
-            'country_from': request.args.get('country_from'),
-            'country_to': request.args.get('country_to'),
-            'date': request.args.get('date'),
-            'max_rate': request.args.get('max_rate'),
-            'min_space': request.args.get('min_space')
-        }
+        # Build query
+        query = Trip.query.filter(Trip.status == 'active')
 
-        # Remove None values
-        filters = {k: v for k, v in filters.items() if v is not None}
-
-        # Get trips
-        trips_list = TripModel.search_trips(filters)
-
-        # Convert ObjectIds to strings
-        for trip in trips_list:
-            trip = convert_objectid_to_string(trip)
-
-        # IMPORTANT: Filter out current user's own trips on backend
+        # Exclude current user's trips if user is logged in
         if current_user:
-            current_user_id = str(current_user['_id'])
-            trips_list = [trip for trip in trips_list if str(trip.get('user_id', '')) != current_user_id]
+            query = query.filter(Trip.user_id != current_user.id)
 
-        return jsonify({
-            "trips": trips_list,
-            "count": len(trips_list),
-            "filters_applied": filters
-        }), 200
+        # Apply filters
+        country_from = request.args.get('country_from')
+        if country_from:
+            query = query.filter(Trip.country_from.ilike(f'%{country_from}%'))
+
+        country_to = request.args.get('country_to')
+        if country_to:
+            query = query.filter(Trip.country_to.ilike(f'%{country_to}%'))
+
+        date_filter = request.args.get('date')
+        if date_filter:
+            trip_date = parse_date_from_ddmmyyyy(date_filter)
+            if trip_date:
+                query = query.filter(Trip.date == trip_date)
+
+        max_rate = request.args.get('max_rate')
+        if max_rate:
+            try:
+                query = query.filter(Trip.rate_per_kg <= float(max_rate))
+            except ValueError:
+                pass
+
+        min_space = request.args.get('min_space')
+        if min_space:
+            try:
+                query = query.filter(Trip.available_cargo_space >= int(min_space))
+            except ValueError:
+                pass
+
+        # Execute query and get results
+        trips = query.order_by(Trip.created_at.desc()).all()
+
+        # Convert to dict and add user info
+        trips_list = []
+        for trip in trips:
+            trip_dict = trip.to_dict()
+            # Add user name for display
+            user = User.query.get(trip.user_id)
+            if user:
+                trip_dict['user_name'] = f"{user.first_name} {user.last_name}".strip() or user.email.split('@')[0]
+            trips_list.append(trip_dict)
+
+        return jsonify(trips_list), 200
 
     except Exception as e:
         print(f"Error searching trips: {e}")
@@ -166,18 +219,17 @@ def search_trips(current_user):
 @trips_bp.route('/my-trips', methods=['GET'])
 @token_required
 def get_my_trips(current_user):
-    """Get current user's trips - exclude deleted trips"""
+    """Get current user's trips"""
     try:
-        status = request.args.get('status')  # Optional status filter
+        status_filter = request.args.get('status', 'active')
 
-        trips_list = TripModel.find_by_user(str(current_user['_id']), status)
+        query = Trip.query.filter_by(user_id=current_user.id)
 
-        # Filter out deleted trips from user's view
-        trips_list = [trip for trip in trips_list if trip.get('status') != 'deleted']
+        if status_filter != 'all':
+            query = query.filter_by(status=status_filter)
 
-        # Convert ObjectIds to strings
-        for trip in trips_list:
-            trip = convert_objectid_to_string(trip)
+        trips = query.order_by(Trip.created_at.desc()).all()
+        trips_list = [trip.to_dict() for trip in trips]
 
         return jsonify({
             "trips": trips_list,
@@ -185,119 +237,105 @@ def get_my_trips(current_user):
         }), 200
 
     except Exception as e:
-        print(f"Error fetching user trips: {e}")
-        return jsonify({"error": "Failed to fetch trips"}), 500
-
-
-# NEW ROUTE: Get trips by specific user ID (for public profiles)
-@trips_bp.route('/user/<user_id>', methods=['GET'])
-def get_user_trips(user_id):
-    """Get trips posted by a specific user (for their public profile)"""
-    try:
-        # Only return active trips for public viewing
-        trips_list = TripModel.find_by_user(user_id, status='active')
-
-        # Limit to last 10 trips for performance
-        trips_list = trips_list[:10]
-
-        # Convert ObjectIds to strings
-        for trip in trips_list:
-            trip = convert_objectid_to_string(trip)
-
-        return jsonify(trips_list), 200  # Returns array directly
-
-    except Exception as e:
-        print(f"Error fetching user trips: {e}")
-        return jsonify({"error": "Failed to fetch user trips"}), 500
+        print(f"Error getting user trips: {e}")
+        return jsonify({"error": "Failed to get trips"}), 500
 
 
 @trips_bp.route('/<trip_id>', methods=['GET'])
-@optional_token
-def get_trip(current_user, trip_id):
-    """Get a specific trip by ID"""
+def get_trip(trip_id):
+    """Get specific trip by ID"""
     try:
-        trip = TripModel.find_by_id(trip_id)
+        trip = Trip.query.get(trip_id)
+
         if not trip:
             return jsonify({"error": "Trip not found"}), 404
 
-        # Check if trip is active or if user is the owner
-        if trip['status'] != 'active':
-            if not current_user or str(trip['user_id']) != str(current_user['_id']):
-                return jsonify({"error": "Trip not found"}), 404
+        trip_dict = trip.to_dict()
 
-        trip = convert_objectid_to_string(trip)
+        # Add user info
+        user = User.query.get(trip.user_id)
+        if user:
+            trip_dict['user_name'] = f"{user.first_name} {user.last_name}".strip() or user.email.split('@')[0]
+            trip_dict['user_email'] = user.email
 
-        return jsonify({"trip": trip}), 200
+        return jsonify(trip_dict), 200
 
     except Exception as e:
-        print(f"Error fetching trip: {e}")
-        return jsonify({"error": "Failed to fetch trip"}), 500
+        print(f"Error getting trip: {e}")
+        return jsonify({"error": "Failed to get trip"}), 500
+
+
+@trips_bp.route('/user/<user_id>', methods=['GET'])
+def get_user_trips(user_id):
+    """Get trips by specific user (for public profile)"""
+    try:
+        # Verify user exists
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        # Get user's active trips
+        trips = Trip.query.filter_by(
+            user_id=user_id,
+            status='active'
+        ).order_by(Trip.created_at.desc()).limit(10).all()
+
+        trips_list = [trip.to_dict() for trip in trips]
+
+        return jsonify(trips_list), 200
+
+    except Exception as e:
+        print(f"Error getting user trips: {e}")
+        return jsonify({"error": "Failed to get user trips"}), 500
 
 
 @trips_bp.route('/<trip_id>/update', methods=['PUT'])
 @token_required
 def update_trip(current_user, trip_id):
-    """Update a trip (only by owner)"""
+    """Update a trip"""
     try:
-        # Find trip and verify ownership
-        trip = TripModel.find_by_id(trip_id)
+        trip = Trip.query.get(trip_id)
+
         if not trip:
             return jsonify({"error": "Trip not found"}), 404
 
-        if str(trip['user_id']) != str(current_user['_id']):
-            return jsonify({"error": "Unauthorized to update this trip"}), 403
+        if trip.user_id != current_user.id:
+            return jsonify({"error": "Unauthorized - not your trip"}), 403
 
         data = request.json
         if not data:
             return jsonify({"error": "No data provided"}), 400
 
-        # Validate updateable fields
+        # Update allowed fields
         updatable_fields = [
-            'country_from', 'country_to', 'date', 'departure_time',
-            'rate_per_kg', 'available_cargo_space', 'currency',
-            'description', 'contact_info', 'status'
+            'country_from', 'country_to', 'rate_per_kg',
+            'available_cargo_space', 'description', 'currency',
+            'contact_info', 'departure_time', 'status'
         ]
 
-        update_data = {}
         for field in updatable_fields:
             if field in data:
-                update_data[field] = data[field]
+                if field == 'date' and data[field]:
+                    trip_date = parse_date_from_ddmmyyyy(data[field])
+                    if trip_date:
+                        trip.date = trip_date
+                elif field == 'departure_time' and data[field]:
+                    try:
+                        trip.departure_time = datetime.strptime(data[field], '%H:%M').time()
+                    except ValueError:
+                        return jsonify({"error": "Invalid departure time format"}), 400
+                else:
+                    setattr(trip, field, data[field])
 
-        if not update_data:
-            return jsonify({"error": "No valid fields to update"}), 400
+        db.session.commit()
 
-        # Validate specific fields if they're being updated
-        if 'date' in update_data:
-            date_valid, date_msg = validate_date(update_data['date'])
-            if not date_valid:
-                return jsonify({"error": date_msg}), 400
-
-        if 'rate_per_kg' in update_data:
-            try:
-                rate = float(update_data['rate_per_kg'])
-                if rate <= 0:
-                    return jsonify({"error": "Rate must be greater than 0"}), 400
-                update_data['rate_per_kg'] = rate
-            except (ValueError, TypeError):
-                return jsonify({"error": "Invalid rate format"}), 400
-
-        if 'available_cargo_space' in update_data:
-            try:
-                space = float(update_data['available_cargo_space'])
-                if space <= 0:
-                    return jsonify({"error": "Cargo space must be greater than 0"}), 400
-                update_data['available_cargo_space'] = space
-            except (ValueError, TypeError):
-                return jsonify({"error": "Invalid cargo space format"}), 400
-
-        # Update trip
-        success = TripModel.update_trip(trip_id, update_data)
-        if not success:
-            return jsonify({"error": "Failed to update trip"}), 500
-
-        return jsonify({"message": "Trip updated successfully"}), 200
+        return jsonify({
+            "message": "Trip updated successfully",
+            "trip": trip.to_dict()
+        }), 200
 
     except Exception as e:
+        db.session.rollback()
         print(f"Error updating trip: {e}")
         return jsonify({"error": "Failed to update trip"}), 500
 
@@ -305,24 +343,23 @@ def update_trip(current_user, trip_id):
 @trips_bp.route('/<trip_id>/delete', methods=['DELETE'])
 @token_required
 def delete_trip(current_user, trip_id):
-    """Delete a trip (only by owner)"""
+    """Delete a trip"""
     try:
-        # Find trip and verify ownership
-        trip = TripModel.find_by_id(trip_id)
+        trip = Trip.query.get(trip_id)
+
         if not trip:
             return jsonify({"error": "Trip not found"}), 404
 
-        if str(trip['user_id']) != str(current_user['_id']):
-            return jsonify({"error": "Unauthorized to delete this trip"}), 403
+        if trip.user_id != current_user.id:
+            return jsonify({"error": "Unauthorized - not your trip"}), 403
 
-        # Soft delete the trip
-        success = TripModel.delete_trip(trip_id)
-        if not success:
-            return jsonify({"error": "Failed to delete trip"}), 500
+        db.session.delete(trip)
+        db.session.commit()
 
         return jsonify({"message": "Trip deleted successfully"}), 200
 
     except Exception as e:
+        db.session.rollback()
         print(f"Error deleting trip: {e}")
         return jsonify({"error": "Failed to delete trip"}), 500
 
@@ -330,27 +367,17 @@ def delete_trip(current_user, trip_id):
 @trips_bp.route('/stats', methods=['GET'])
 @token_required
 def get_trip_stats(current_user):
-    """Get trip statistics for the current user"""
+    """Get trip statistics for current user"""
     try:
-        user_id = str(current_user['_id'])
+        total_trips = Trip.query.filter_by(user_id=current_user.id).count()
+        active_trips = Trip.query.filter_by(user_id=current_user.id, status='active').count()
 
-        # Get all user trips (excluding deleted ones)
-        all_trips = TripModel.find_by_user(user_id)
-        all_trips = [trip for trip in all_trips if trip.get('status') != 'deleted']
-
-        # Calculate statistics
-        stats = {
-            'total_trips': len(all_trips),
-            'active_trips': len([t for t in all_trips if t['status'] == 'active']),
-            'completed_trips': len([t for t in all_trips if t['status'] == 'completed']),
-            'cancelled_trips': len([t for t in all_trips if t['status'] == 'cancelled']),
-            'total_cargo_space_offered': sum(
-                t.get('original_cargo_space', t.get('available_cargo_space', 0)) for t in all_trips),
-            'average_rate': sum(t['rate_per_kg'] for t in all_trips) / len(all_trips) if all_trips else 0
-        }
-
-        return jsonify({"stats": stats}), 200
+        return jsonify({
+            "total_trips": total_trips,
+            "active_trips": active_trips,
+            "completed_trips": total_trips - active_trips
+        }), 200
 
     except Exception as e:
-        print(f"Error calculating stats: {e}")
-        return jsonify({"error": "Failed to calculate statistics"}), 500
+        print(f"Error getting trip stats: {e}")
+        return jsonify({"error": "Failed to get trip statistics"}), 500

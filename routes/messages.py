@@ -1,16 +1,17 @@
-# routes/messages.py
 from flask import Blueprint, request, jsonify
-from bson import ObjectId
+from models import db, Message, User, Trip
 from auth_guard import token_required
-from db import get_database
 from datetime import datetime
+from sqlalchemy import or_, and_, desc
 
 messages_bp = Blueprint('messages', __name__)
 
 
-def get_db():
-    """Get database connection"""
-    return get_database()
+def generate_conversation_id(user1_id, user2_id):
+    """Generate a consistent conversation ID for two users"""
+    # Sort IDs to ensure same conversation ID regardless of who starts the conversation
+    ids = sorted([str(user1_id), str(user2_id)])
+    return f"{ids[0]}_{ids[1]}"
 
 
 @messages_bp.route('/send', methods=['POST'])
@@ -23,8 +24,8 @@ def send_message(current_user):
         if not data:
             return jsonify({'error': 'No data provided'}), 400
 
-        # Validate required fields
-        required_fields = ['recipient_id', 'message', 'trip_id']
+        # Validate required fields - trip_id is optional
+        required_fields = ['recipient_id', 'message']
         for field in required_fields:
             if field not in data:
                 return jsonify({'error': f'{field} is required'}), 400
@@ -36,79 +37,46 @@ def send_message(current_user):
         if len(message_text) > 1000:
             return jsonify({'error': 'Message too long (max 1000 characters)'}), 400
 
-        # Get current user info
-        db = get_db()
-        users_collection = db.users
-
-        if isinstance(current_user, str):
-            sender = users_collection.find_one({"email": current_user})
-        else:
-            sender = current_user
-
-        if not sender:
-            return jsonify({'error': 'Sender not found'}), 404
-
-        # Validate recipient exists
-        try:
-            recipient = users_collection.find_one({"_id": ObjectId(data['recipient_id'])})
-            if not recipient:
-                return jsonify({'error': 'Recipient not found'}), 404
-        except:
-            return jsonify({'error': 'Invalid recipient ID'}), 400
+        # Verify recipient exists
+        recipient = User.query.get(data['recipient_id'])
+        if not recipient:
+            return jsonify({'error': 'Recipient not found'}), 404
 
         # Prevent self-messaging
-        if str(sender['_id']) == str(data['recipient_id']):
+        if str(current_user.id) == str(data['recipient_id']):
             return jsonify({'error': 'Cannot send message to yourself'}), 400
 
         # Validate trip exists (optional - for trip context)
         trip_id = data.get('trip_id')
         if trip_id:
-            try:
-                trips_collection = db.trips
-                trip = trips_collection.find_one({"_id": ObjectId(trip_id)})
-                if not trip:
-                    return jsonify({'error': 'Trip not found'}), 404
-            except:
-                return jsonify({'error': 'Invalid trip ID'}), 400
+            trip = Trip.query.get(trip_id)
+            if not trip:
+                return jsonify({'error': 'Trip not found'}), 404
 
         # Create message
-        messages_collection = db.messages
+        new_message = Message(
+            sender_id=current_user.id,
+            recipient_id=data['recipient_id'],
+            trip_id=trip_id,
+            message=message_text,
+            conversation_id=generate_conversation_id(current_user.id, data['recipient_id']),
+            read=False
+        )
 
-        message_doc = {
-            'sender_id': sender['_id'],
-            'recipient_id': ObjectId(data['recipient_id']),
-            'trip_id': ObjectId(trip_id) if trip_id else None,
-            'message': message_text,
-            'created_at': datetime.utcnow(),
-            'read': False,
-            'conversation_id': generate_conversation_id(str(sender['_id']), data['recipient_id'])
-        }
-
-        result = messages_collection.insert_one(message_doc)
+        db.session.add(new_message)
+        db.session.commit()
 
         # Return the created message
-        created_message = messages_collection.find_one({"_id": result.inserted_id})
-
-        # Convert ObjectIds to strings for JSON response
-        message_response = {
-            'id': str(created_message['_id']),
-            'sender_id': str(created_message['sender_id']),
-            'recipient_id': str(created_message['recipient_id']),
-            'trip_id': str(created_message['trip_id']) if created_message['trip_id'] else None,
-            'message': created_message['message'],
-            'created_at': created_message['created_at'].isoformat() + 'Z',
-            'read': created_message['read'],
-            'conversation_id': created_message['conversation_id'],
-            'sender_name': f"{sender.get('firstname', '')} {sender.get('lastname', '')}".strip() or
-                           sender.get('email', '').split('@')[0]
-        }
+        message_response = new_message.to_dict()
+        message_response['is_mine'] = True
 
         return jsonify({
             'message': 'Message sent successfully',
-            'data': message_response
+            'message_data': message_response
         }), 201
 
     except Exception as e:
+        db.session.rollback()
         print(f"Error sending message: {e}")
         return jsonify({'error': 'Failed to send message'}), 500
 
@@ -116,75 +84,54 @@ def send_message(current_user):
 @messages_bp.route('/conversation/<user_id>', methods=['GET'])
 @token_required
 def get_conversation(current_user, user_id):
-    """Get conversation between current user and another user"""
+    """Get conversation between current user and specified user"""
     try:
-        # Get current user info
-        db = get_db()
-        users_collection = db.users
-
-        if isinstance(current_user, str):
-            sender = users_collection.find_one({"email": current_user})
-        else:
-            sender = current_user
-
-        if not sender:
+        # Verify other user exists
+        other_user = User.query.get(user_id)
+        if not other_user:
             return jsonify({'error': 'User not found'}), 404
 
-        # Validate other user exists
-        try:
-            other_user = users_collection.find_one({"_id": ObjectId(user_id)})
-            if not other_user:
-                return jsonify({'error': 'User not found'}), 404
-        except:
-            return jsonify({'error': 'Invalid user ID'}), 400
-
         # Generate conversation ID
-        conversation_id = generate_conversation_id(str(sender['_id']), user_id)
+        conversation_id = generate_conversation_id(current_user.id, user_id)
 
-        # Get messages from conversation
-        messages_collection = db.messages
-        messages = list(messages_collection.find({
-            'conversation_id': conversation_id
-        }).sort('created_at', 1))  # Oldest first
+        # Get all messages in this conversation
+        messages = Message.query.filter_by(
+            conversation_id=conversation_id
+        ).order_by(Message.created_at.asc()).all()
 
-        # Mark messages as read (where current user is recipient)
-        messages_collection.update_many({
-            'conversation_id': conversation_id,
-            'recipient_id': sender['_id'],
-            'read': False
-        }, {
-            '$set': {'read': True}
-        })
+        # Convert messages to dict and add is_mine flag
+        messages_list = []
+        for message in messages:
+            message_dict = message.to_dict()
+            message_dict['is_mine'] = message.sender_id == current_user.id
+            messages_list.append(message_dict)
 
-        # Convert to response format
-        message_list = []
-        for msg in messages:
-            message_list.append({
-                'id': str(msg['_id']),
-                'sender_id': str(msg['sender_id']),
-                'recipient_id': str(msg['recipient_id']),
-                'trip_id': str(msg['trip_id']) if msg['trip_id'] else None,
-                'message': msg['message'],
-                'created_at': msg['created_at'].isoformat(),
-                'read': msg['read'],
-                'is_mine': str(msg['sender_id']) == str(sender['_id'])
-            })
+        # Mark messages as read (messages sent TO current user)
+        unread_messages = Message.query.filter_by(
+            conversation_id=conversation_id,
+            recipient_id=current_user.id,
+            read=False
+        ).all()
+
+        for msg in unread_messages:
+            msg.read = True
+
+        if unread_messages:
+            db.session.commit()
 
         return jsonify({
-            'conversation_id': conversation_id,
-            'messages': message_list,
-            'count': len(message_list),
+            'messages': messages_list,
             'other_user': {
-                'id': str(other_user['_id']),
-                'name': f"{other_user.get('firstname', '')} {other_user.get('lastname', '')}".strip() or
-                        other_user.get('email', '').split('@')[0],
-                'email': other_user.get('email', '')
-            }
+                'id': other_user.id,
+                'name': f"{other_user.first_name} {other_user.last_name}".strip() or other_user.email.split('@')[0],
+                'email': other_user.email
+            },
+            'conversation_id': conversation_id
         }), 200
 
     except Exception as e:
-        print(f"Error fetching conversation: {e}")
-        return jsonify({'error': 'Failed to fetch conversation'}), 500
+        print(f"Error getting conversation: {e}")
+        return jsonify({'error': 'Failed to get conversation'}), 500
 
 
 @messages_bp.route('/conversations', methods=['GET'])
@@ -192,136 +139,110 @@ def get_conversation(current_user, user_id):
 def get_conversations(current_user):
     """Get list of all conversations for current user"""
     try:
-        # Get current user info
-        db = get_db()
-        users_collection = db.users
+        # Get all unique conversation IDs where user is involved
+        sent_conversations = db.session.query(Message.conversation_id).filter_by(
+            sender_id=current_user.id
+        ).distinct().subquery()
 
-        if isinstance(current_user, str):
-            user = users_collection.find_one({"email": current_user})
-        else:
-            user = current_user
+        received_conversations = db.session.query(Message.conversation_id).filter_by(
+            recipient_id=current_user.id
+        ).distinct().subquery()
 
-        if not user:
-            return jsonify({'error': 'User not found'}), 404
+        # Get the latest message from each conversation
+        from sqlalchemy import text
+        conversations_query = db.session.execute(text("""
+            SELECT DISTINCT conversation_id,
+                   (SELECT message FROM messages m2 
+                    WHERE m2.conversation_id = m1.conversation_id 
+                    ORDER BY m2.created_at DESC LIMIT 1) as last_message,
+                   (SELECT created_at FROM messages m3 
+                    WHERE m3.conversation_id = m1.conversation_id 
+                    ORDER BY m3.created_at DESC LIMIT 1) as last_message_time,
+                   (SELECT sender_id FROM messages m4 
+                    WHERE m4.conversation_id = m1.conversation_id 
+                    ORDER BY m4.created_at DESC LIMIT 1) as last_sender_id
+            FROM messages m1 
+            WHERE (sender_id = :user_id OR recipient_id = :user_id)
+            ORDER BY last_message_time DESC
+        """), {'user_id': current_user.id})
 
-        # Get all unique conversations for this user
-        messages_collection = db.messages
-
-        # Find all conversations where user is sender or recipient
-        conversations = list(messages_collection.aggregate([
-            {
-                '$match': {
-                    '$or': [
-                        {'sender_id': user['_id']},
-                        {'recipient_id': user['_id']}
-                    ]
-                }
-            },
-            {
-                '$sort': {'created_at': -1}
-            },
-            {
-                '$group': {
-                    '_id': '$conversation_id',
-                    'last_message': {'$first': '$message'},
-                    'last_message_time': {'$first': '$created_at'},
-                    'last_sender_id': {'$first': '$sender_id'},
-                    'trip_id': {'$first': '$trip_id'},
-                    'sender_id': {'$first': '$sender_id'},
-                    'recipient_id': {'$first': '$recipient_id'}
-                }
-            },
-            {
-                '$sort': {'last_message_time': -1}
-            }
-        ]))
-
-        # Get other user info for each conversation
         conversation_list = []
-        for conv in conversations:
+        for conv in conversations_query:
             # Determine who the "other user" is
-            other_user_id = conv['recipient_id'] if conv['sender_id'] == user['_id'] else conv['sender_id']
+            conv_parts = conv.conversation_id.split('_')
+            other_user_id = conv_parts[1] if conv_parts[0] == current_user.id else conv_parts[0]
 
             # Get other user info
-            other_user = users_collection.find_one({"_id": other_user_id})
+            other_user = User.query.get(other_user_id)
             if not other_user:
                 continue
 
             # Count unread messages
-            unread_count = messages_collection.count_documents({
-                'conversation_id': conv['_id'],
-                'recipient_id': user['_id'],
-                'read': False
-            })
+            unread_count = Message.query.filter_by(
+                conversation_id=conv.conversation_id,
+                recipient_id=current_user.id,
+                read=False
+            ).count()
 
             conversation_list.append({
-                'conversation_id': conv['_id'],
+                'conversation_id': conv.conversation_id,
                 'other_user': {
-                    'id': str(other_user['_id']),
-                    'name': f"{other_user.get('firstname', '')} {other_user.get('lastname', '')}".strip() or
-                            other_user.get('email', '').split('@')[0],
-                    'email': other_user.get('email', '')
+                    'id': other_user.id,
+                    'name': f"{other_user.first_name} {other_user.last_name}".strip() or other_user.email.split('@')[0],
+                    'email': other_user.email
                 },
-                'last_message': conv['last_message'],
-                'last_message_time': conv['last_message_time'].isoformat(),
+                'last_message': conv.last_message,
+                'last_message_time': conv.last_message_time.isoformat() if conv.last_message_time else None,
                 'unread_count': unread_count,
-                'trip_id': str(conv['trip_id']) if conv['trip_id'] else None
+                'is_last_message_mine': conv.last_sender_id == current_user.id
             })
 
         return jsonify({
             'conversations': conversation_list,
-            'count': len(conversation_list)
+            'total_conversations': len(conversation_list)
         }), 200
 
     except Exception as e:
-        print(f"Error fetching conversations: {e}")
-        return jsonify({'error': 'Failed to fetch conversations'}), 500
+        print(f"Error getting conversations: {e}")
+        return jsonify({'error': 'Failed to get conversations'}), 500
 
 
 @messages_bp.route('/mark-read', methods=['POST'])
 @token_required
-def mark_messages_read(current_user):
+def mark_messages_as_read(current_user):
     """Mark messages as read"""
     try:
         data = request.get_json()
+        conversation_id = data.get('conversation_id')
 
-        if not data or 'conversation_id' not in data:
+        if not conversation_id:
             return jsonify({'error': 'conversation_id is required'}), 400
 
-        # Get current user info
-        db = get_db()
-        users_collection = db.users
+        # Mark all unread messages in this conversation as read
+        unread_messages = Message.query.filter_by(
+            conversation_id=conversation_id,
+            recipient_id=current_user.id,
+            read=False
+        ).all()
 
-        if isinstance(current_user, str):
-            user = users_collection.find_one({"email": current_user})
-        else:
-            user = current_user
+        for message in unread_messages:
+            message.read = True
 
-        if not user:
-            return jsonify({'error': 'User not found'}), 404
-
-        # Mark messages as read
-        messages_collection = db.messages
-        result = messages_collection.update_many({
-            'conversation_id': data['conversation_id'],
-            'recipient_id': user['_id'],
-            'read': False
-        }, {
-            '$set': {'read': True}
-        })
+        db.session.commit()
 
         return jsonify({
             'message': 'Messages marked as read',
-            'updated_count': result.modified_count
+            'updated_count': len(unread_messages)
         }), 200
 
     except Exception as e:
+        db.session.rollback()
         print(f"Error marking messages as read: {e}")
         return jsonify({'error': 'Failed to mark messages as read'}), 500
 
 
-def generate_conversation_id(user1_id, user2_id):
-    """Generate a consistent conversation ID for two users"""
-    # Sort IDs to ensure same conversation ID regardless of who starts the conversation
-    ids = sorted([str(user1_id), str(user2_id)])
-    return f"{ids[0]}_{ids[1]}"
+@messages_bp.route('/<user_id>', methods=['GET'])
+@token_required
+def get_messages_with_user(current_user, user_id):
+    """Alternative endpoint - same as /conversation/<user_id>"""
+    return get_conversation(current_user, user_id)
