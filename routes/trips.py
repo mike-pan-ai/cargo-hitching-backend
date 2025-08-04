@@ -308,7 +308,7 @@ def update_trip(current_user, trip_id):
 
         # Update allowed fields
         updatable_fields = [
-            'country_from', 'country_to', 'rate_per_kg',
+            'country_from', 'country_to', 'date', 'rate_per_kg',
             'available_cargo_space', 'description', 'currency',
             'contact_info', 'departure_time', 'status'
         ]
@@ -381,3 +381,14 @@ def get_trip_stats(current_user):
     except Exception as e:
         print(f"Error getting trip stats: {e}")
         return jsonify({"error": "Failed to get trip statistics"}), 500
+
+
+@trips_bp.route('', methods=['GET'])
+def get_all_trips():
+    """Get all active trips"""
+    try:
+        # Your existing search logic (copy from search_trips function)
+        # Or call the same function that /search uses
+        return search_trips()  # Reuse your search logic
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
