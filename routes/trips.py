@@ -221,7 +221,7 @@ def search_trips(current_user):
 def get_my_trips(current_user):
     """Get current user's trips"""
     try:
-        status_filter = request.args.get('status', 'active')
+        status_filter = request.args.get('status', 'all')
 
         query = Trip.query.filter_by(user_id=current_user.id)
 
